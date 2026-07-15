@@ -66,6 +66,45 @@ server.tool(
   },
 );
 
+// --- Rename an agent ---
+server.tool(
+  'bridge-rename',
+  'Rename your agent identity on the bridge, preserving your project, join date, and message history.',
+  {
+    oldName: z.string().describe('Your current agent name'),
+    newName: z.string().describe('The new agent name to switch to'),
+  },
+  async ({ oldName, newName }) => {
+    const state = loadState();
+    const agent = state.agents[oldName];
+    if (!agent) {
+      return {
+        content: [{ type: 'text' as const, text: `No agent named **${oldName}** found.` }],
+      };
+    }
+    if (state.agents[newName]) {
+      return {
+        content: [{ type: 'text' as const, text: `**${newName}** is already taken by another agent.` }],
+      };
+    }
+    delete state.agents[oldName];
+    state.agents[newName] = { ...agent, name: newName };
+    for (const m of state.messages) {
+      if (m.from === oldName) m.from = newName;
+      if (m.to === oldName) m.to = newName;
+    }
+    saveState(state);
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Renamed **${oldName}** → **${newName}**. Message history preserved.`,
+        },
+      ],
+    };
+  },
+);
+
 // --- Send a message ---
 server.tool(
   'bridge-send',

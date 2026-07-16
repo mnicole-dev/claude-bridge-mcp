@@ -3,36 +3,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { join } from 'path';
-
-const BRIDGE_FILE = join(process.env.BRIDGE_PATH || '/tmp', 'claude-bridge.json');
-
-interface Message {
-  id: number;
-  from: string;
-  to: string | 'all';
-  content: string;
-  timestamp: string;
-  read: boolean;
-}
-
-interface BridgeState {
-  agents: Record<string, { name: string; project: string; joinedAt: string }>;
-  messages: Message[];
-  nextId: number;
-}
-
-function loadState(): BridgeState {
-  if (existsSync(BRIDGE_FILE)) {
-    return JSON.parse(readFileSync(BRIDGE_FILE, 'utf-8'));
-  }
-  return { agents: {}, messages: [], nextId: 1 };
-}
-
-function saveState(state: BridgeState): void {
-  writeFileSync(BRIDGE_FILE, JSON.stringify(state, null, 2));
-}
+import { loadState, withState, type Message } from './state.js';
 
 const server = new McpServer({
   name: 'claude-bridge',
@@ -48,21 +19,19 @@ server.tool(
     project: z.string().describe('The project you are working on (e.g., "erezo", "emapack")'),
   },
   async ({ name, project }) => {
-    const state = loadState();
-    state.agents[name] = { name, project, joinedAt: new Date().toISOString() };
-    saveState(state);
-    const others = Object.values(state.agents)
-      .filter((a) => a.name !== name)
-      .map((a) => `- **${a.name}** (${a.project})`)
-      .join('\n');
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: `Registered as **${name}** on project **${project}**.\n\n${others ? `Other agents online:\n${others}` : 'No other agents online yet.'}`,
-        },
-      ],
-    };
+    const text = withState((state) => {
+      const existing = state.agents[name];
+      if (existing && existing.project !== project) {
+        return `**${name}** is already registered for project **${existing.project}**. Choose a different name, or use bridge-rename if this is a takeover.`;
+      }
+      state.agents[name] = { name, project, joinedAt: new Date().toISOString() };
+      const others = Object.values(state.agents)
+        .filter((a) => a.name !== name)
+        .map((a) => `- **${a.name}** (${a.project})`)
+        .join('\n');
+      return `Registered as **${name}** on project **${project}**.\n\n${others ? `Other agents online:\n${others}` : 'No other agents online yet.'}`;
+    });
+    return { content: [{ type: 'text' as const, text }] };
   },
 );
 
@@ -75,33 +44,23 @@ server.tool(
     newName: z.string().describe('The new agent name to switch to'),
   },
   async ({ oldName, newName }) => {
-    const state = loadState();
-    const agent = state.agents[oldName];
-    if (!agent) {
-      return {
-        content: [{ type: 'text' as const, text: `No agent named **${oldName}** found.` }],
-      };
-    }
-    if (state.agents[newName]) {
-      return {
-        content: [{ type: 'text' as const, text: `**${newName}** is already taken by another agent.` }],
-      };
-    }
-    delete state.agents[oldName];
-    state.agents[newName] = { ...agent, name: newName };
-    for (const m of state.messages) {
-      if (m.from === oldName) m.from = newName;
-      if (m.to === oldName) m.to = newName;
-    }
-    saveState(state);
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: `Renamed **${oldName}** → **${newName}**. Message history preserved.`,
-        },
-      ],
-    };
+    const text = withState((state) => {
+      const agent = state.agents[oldName];
+      if (!agent) {
+        return `No agent named **${oldName}** found.`;
+      }
+      if (state.agents[newName]) {
+        return `**${newName}** is already taken by another agent.`;
+      }
+      delete state.agents[oldName];
+      state.agents[newName] = { ...agent, name: newName };
+      for (const m of state.messages) {
+        if (m.from === oldName) m.from = newName;
+        if (m.to === oldName) m.to = newName;
+      }
+      return `Renamed **${oldName}** → **${newName}**. Message history preserved.`;
+    });
+    return { content: [{ type: 'text' as const, text }] };
   },
 );
 
@@ -115,24 +74,20 @@ server.tool(
     message: z.string().describe('The message content'),
   },
   async ({ from, to, message }) => {
-    const state = loadState();
-    const msg: Message = {
-      id: state.nextId++,
-      from,
-      to,
-      content: message,
-      timestamp: new Date().toISOString(),
-      read: false,
-    };
-    state.messages.push(msg);
-    saveState(state);
+    const id = withState((state) => {
+      const msg: Message = {
+        id: state.nextId++,
+        from,
+        to,
+        content: message,
+        timestamp: new Date().toISOString(),
+        read: false,
+      };
+      state.messages.push(msg);
+      return msg.id;
+    });
     return {
-      content: [
-        {
-          type: 'text' as const,
-          text: `Message #${msg.id} sent to **${to}**`,
-        },
-      ],
+      content: [{ type: 'text' as const, text: `Message #${id} sent to **${to}**` }],
     };
   },
 );
@@ -146,41 +101,32 @@ server.tool(
     includeRead: z.boolean().optional().describe('Include already-read messages (default: false)'),
   },
   async ({ name, includeRead }) => {
-    const state = loadState();
-    const msgs = state.messages.filter(
-      (m) =>
-        (m.to === name || m.to === 'all') &&
-        m.from !== name &&
-        (includeRead || !m.read),
-    );
-
-    // Mark as read
-    for (const m of msgs) {
-      if (m.to === name) m.read = true;
-    }
-    saveState(state);
-
-    if (msgs.length === 0) {
-      return {
-        content: [{ type: 'text' as const, text: 'No new messages.' }],
-      };
-    }
-
-    const formatted = msgs
-      .map(
+    const text = withState((state) => {
+      const msgs = state.messages.filter(
         (m) =>
-          `**#${m.id}** [${m.timestamp.slice(11, 19)}] **${m.from}** → ${m.to === 'all' ? 'all' : 'you'}:\n${m.content}`,
-      )
-      .join('\n\n---\n\n');
+          (m.to === name || m.to === 'all') &&
+          m.from !== name &&
+          (includeRead || !m.read),
+      );
 
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: `${msgs.length} message(s):\n\n${formatted}`,
-        },
-      ],
-    };
+      for (const m of msgs) {
+        if (m.to === name) m.read = true;
+      }
+
+      if (msgs.length === 0) {
+        return 'No new messages.';
+      }
+
+      const formatted = msgs
+        .map(
+          (m) =>
+            `**#${m.id}** [${m.timestamp.slice(11, 19)}] **${m.from}** → ${m.to === 'all' ? 'all' : 'you'}:\n${m.content}`,
+        )
+        .join('\n\n---\n\n');
+
+      return `${msgs.length} message(s):\n\n${formatted}`;
+    });
+    return { content: [{ type: 'text' as const, text }] };
   },
 );
 
@@ -239,7 +185,11 @@ server.tool(
   'Clear all messages and agents. Use with caution.',
   {},
   async () => {
-    saveState({ agents: {}, messages: [], nextId: 1 });
+    withState((state) => {
+      state.agents = {};
+      state.messages = [];
+      state.nextId = 1;
+    });
     return {
       content: [{ type: 'text' as const, text: 'Bridge reset. All messages and agents cleared.' }],
     };

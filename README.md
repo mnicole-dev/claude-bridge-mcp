@@ -50,6 +50,20 @@ Add to your Claude Code MCP config (`~/.claude.json`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BRIDGE_PATH` | `/tmp` | Directory where the bridge JSON file is stored |
+| `BRIDGE_RETENTION_DAYS` | `7` | Read messages older than this are purged automatically on the next write |
+
+## Concurrency and data integrity
+
+Since multiple Claude Code instances write to the same JSON file, every mutating tool
+(`bridge-join`, `bridge-rename`, `bridge-send`, `bridge-read`, `bridge-reset`) runs
+under an exclusive file lock (`claude-bridge.json.lock`, acquired via atomic `O_EXCL`
+file creation) so concurrent writes can't clobber each other. A lock older than 10s is
+considered stale (crashed process) and reclaimed automatically. Writes go through a
+temp-file-then-rename so a reader never sees a half-written file.
+
+`bridge-join` also checks for name collisions: joining with a name already registered
+under a *different* project returns a warning instead of silently overwriting it — use
+`bridge-rename` if you intend to take the name over.
 
 ## Auto-connect hook (optional)
 
